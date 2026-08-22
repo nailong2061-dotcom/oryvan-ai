@@ -238,7 +238,7 @@
   const state = {
     apiKey: localStorage.getItem(LS.key) || '',
     systemPrompt: localStorage.getItem(LS.prompt) || DEFAULT_PROMPT,
-    model: localStorage.getItem('fada_model') || 'gemini-2.5-flash',
+    model: localStorage.getItem('fada_model') || 'gemini-1.5-flash',
     useSearch: false,
     apiMode: 'browser',
     proxyUrl: '/api/gemini',
@@ -265,9 +265,9 @@
     $('apiKeyInput').value = state.apiKey;
     $('systemPromptInput').value = state.systemPrompt;
     const saved = safeJson(localStorage.getItem(LS.settings), {});
-    state.apiMode = saved.apiMode || 'browser'; state.proxyUrl = saved.proxyUrl || '/api/gemini'; state.useSearch = saved.useSearch ?? false; state.saveHistory = saved.saveHistory ?? true;
-    $('apiMode').value=state.apiMode; $('proxyUrlInput').value=state.proxyUrl; $('searchPref').checked=state.useSearch; $('historyPref').checked=state.saveHistory;
-    $('searchToggle').classList.toggle('text-cyan-300',state.useSearch); $('searchToggle').classList.toggle('border-cyan-500/40',state.useSearch);
+    state.apiMode = saved.apiMode || 'browser'; state.proxyUrl = saved.proxyUrl || '/api/gemini'; state.useSearch = false; state.saveHistory = saved.saveHistory ?? true;
+    $('apiMode').value=state.apiMode; $('proxyUrlInput').value=state.proxyUrl; $('searchPref').checked=false; $('historyPref').checked=state.saveHistory;
+    $('searchToggle').classList.toggle('text-cyan-300',false); $('searchToggle').classList.toggle('border-cyan-500/40',false);
     $('securityNote').classList.toggle('hidden', state.apiMode !== 'browser');
     $('keyField').style.display = state.apiMode==='browser'?'block':'none';
     updateApiStatus(); renderHistory(); bindEvents();
@@ -333,7 +333,11 @@
     finally { state.isGenerating=false; state.controller=null; setGeneratingUI(false); scrollBottom(); }
   }
 
-  function endpoint(){ return state.apiMode==='proxy' ? `${state.proxyUrl}?model=${encodeURIComponent(state.model)}` : `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(state.model)}:streamGenerateContent?alt=sse`; }
+  function endpoint(){
+    return state.apiMode==='proxy'
+      ? `${state.proxyUrl}?model=${encodeURIComponent(state.model)}`
+      : `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(state.model)}:streamGenerateContent?key=${encodeURIComponent(state.apiKey)}&alt=sse`;
+  }
   function buildContents(){
     return state.history.map(m=>({role:m.role==='model'?'model':'user',parts:[...(m.attachments||[]).filter(a=>!a.omitted&&a.data).map(a=>({inline_data:{mime_type:a.mime,data:a.data}})),...(m.attachments||[]).filter(a=>a.omitted).map(a=>({text:`[Lampiran sebelumnya: ${a.name}; data asli tidak disimpan di localStorage.]`})),...(m.text?[{text:m.text}]:[])]}));
   }
@@ -343,7 +347,7 @@
     return body;
   }
   async function streamGemini({aiId,placeholder}){
-    state.controller=new AbortController(); const headers={'Content-Type':'application/json'}; if(state.apiMode==='browser') headers['x-goog-api-key']=state.apiKey;
+    state.controller=new AbortController(); const headers={'Content-Type':'application/json'};
     let response;
     for(let attempt=0;attempt<3;attempt++){
       try{ response=await fetch(endpoint(),{method:'POST',headers,body:JSON.stringify(buildBody()),signal:state.controller.signal}); if(response.ok)break; if(response.status===429||response.status>=500){await sleep(700*(attempt+1));continue;} break; }
