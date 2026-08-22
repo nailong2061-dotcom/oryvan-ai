@@ -1,7 +1,7 @@
-export default async function handler(req, res) {
+module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
-  const model = req.query.model || 'gemini-1.5-flash';
+  const model = req.query.model || 'gemini-2.5-flash';
   const apiKey = process.env.GEMINI_API_KEY;
 
   if (!apiKey) return res.status(500).json({ error: 'API Key belum dikonfigurasi di Vercel' });
@@ -32,4 +32,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-}
+};
