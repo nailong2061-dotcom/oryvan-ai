@@ -9,12 +9,6 @@ const ALLOWED_MODELS = new Set([
 
 const DEFAULT_MODEL = 'gemini-3.6-flash';
 
-/*
- * Instruksi inti ORYVAN berada di backend.
- *
- * Dengan begitu frontend tidak menjadi sumber utama
- * identitas/instruksi sistem ORYVAN.
- */
 const ORYVAN_SYSTEM_PROMPT = `
 Kamu adalah ORYVAN, asisten AI pribadi yang cerdas, terstruktur, jujur tentang ketidakpastian, dan berorientasi pada solusi.
 
@@ -55,63 +49,43 @@ KEAMANAN:
 ORYVAN adalah asisten AI pribadi yang berorientasi pada solusi, bukan sekadar chatbot.
 `;
 
-/* ================================
-   LIMITS
-================================ */
-
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
-
 const MAX_CONTENTS = 40;
 
-const MAX_PARTS_PER_MESSAGE = 12;
-
-const MAX_TEXT_LENGTH = 120_000;
-
-const MAX_TOTAL_TEXT_LENGTH = 350_000;
-
-const MAX_INLINE_DATA_BYTES = 2_500_000;
-
-const MAX_INLINE_ATTACHMENTS = 6;
-
+const RATE_WINDOW_MS = 60_000;
 const MAX_REQUESTS_PER_WINDOW = 30;
 
-const RATE_WINDOW_MS = 60_000;
-
-/*
- * In-memory rate limiter.
- *
- * Cocok untuk perlindungan dasar proyek pribadi.
- * Pada serverless, instance dapat berubah sehingga
- * ini bukan pengganti rate limiter terdistribusi.
- */
 const buckets = new Map();
 
-/* ================================
-   ALLOWED MIME TYPES
-================================ */
+function getClientKey(req) {
+  const forwarded = req.headers?.['x-forwarded-for'];
 
-const ALLOWED_INLINE_MIME_PREFIXES = [
-  'image/',
-  'audio/',
-  'video/'
-];
-
-const ALLOWED_INLINE_MIME_TYPES = new Set([
-  'application/pdf',
-  'text/plain',
-  'text/csv',
-  'application/json'
-]);
-
-/* ================================
-   UTILITY
-================================ */
-
-function sendJson(res, status, payload) {
-  if (res.headersSent) {
-    return;
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
   }
 
+  return req.socket?.remoteAddress || 'unknown';
+}
+
+function rateLimited(key) {
+  const now = Date.now();
+  const current = buckets.get(key);
+
+  if (!current || now - current.startedAt >= RATE_WINDOW_MS) {
+    buckets.set(key, {
+      startedAt: now,
+      count: 1
+    });
+
+    return false;
+  }
+
+  current.count += 1;
+
+  return current.count > MAX_REQUESTS_PER_WINDOW;
+}
+
+function sendJson(res, status, payload) {
   res.statusCode = status;
 
   res.setHeader(
@@ -119,30 +93,15 @@ function sendJson(res, status, payload) {
     'application/json; charset=utf-8'
   );
 
-  res.setHeader(
-    'Cache-Control',
-    'no-store'
-  );
-
-  return res.end(
-    JSON.stringify(payload)
-  );
+  return res.end(JSON.stringify(payload));
 }
 
 function setSecurityHeaders(res) {
-  res.setHeader(
-    'Cache-Control',
-    'no-store'
-  );
+  res.setHeader('Cache-Control', 'no-store');
 
   res.setHeader(
     'X-Content-Type-Options',
     'nosniff'
-  );
-
-  res.setHeader(
-    'X-Frame-Options',
-    'DENY'
   );
 
   res.setHeader(
@@ -151,767 +110,333 @@ function setSecurityHeaders(res) {
   );
 
   res.setHeader(
+    'X-Frame-Options',
+    'DENY'
+  );
+
+  res.setHeader(
     'Permissions-Policy',
     'camera=(), microphone=(), geolocation=()'
   );
-
-  /*
-   * API ini tidak dimaksudkan untuk menjadi
-   * halaman HTML yang boleh di-embed.
-   */
-  res.setHeader(
-    'Content-Security-Policy',
-    "default-src 'none'; frame-ancestors 'none'"
-  );
 }
 
-function getClientKey(req) {
-  /*
-   * Pada platform seperti Vercel, x-forwarded-for
-   * biasanya diisi oleh infrastructure proxy.
-   *
-   * Jangan menggunakan API key atau cookie sebagai
-   * identifier rate limit.
-   */
-  const forwarded =
-    req.headers?.['x-forwarded-for'];
-
+function getErrorMessage(error, fallback) {
   if (
-    typeof forwarded === 'string' &&
-    forwarded.trim()
+    error &&
+    typeof error === 'object' &&
+    typeof error.message === 'string' &&
+    error.message.trim()
   ) {
-    return forwarded
-      .split(',')[0]
-      .trim()
-      .slice(0, 128);
+    return error.message;
   }
 
-  const realIp =
-    req.headers?.['x-real-ip'];
-
-  if (
-    typeof realIp === 'string' &&
-    realIp.trim()
-  ) {
-    return realIp
-      .trim()
-      .slice(0, 128);
-  }
-
-  return (
-    req.socket?.remoteAddress ||
-    'unknown'
-  );
+  return fallback;
 }
 
-function rateLimited(key) {
-  const now = Date.now();
+function parseGoogleError(data, status) {
+  let message = `Gemini API error (${status})`;
 
-  const current = buckets.get(key);
+  try {
+    const parsed = JSON.parse(data);
 
-  if (
-    !current ||
-    now - current.startedAt >= RATE_WINDOW_MS
-  ) {
-    buckets.set(key, {
-      startedAt: now,
-      count: 1
-    });
-
-    cleanupBuckets(now);
-
-    return false;
-  }
-
-  current.count += 1;
-
-  return (
-    current.count >
-    MAX_REQUESTS_PER_WINDOW
-  );
-}
-
-function cleanupBuckets(now) {
-  /*
-   * Mencegah Map terus membesar jika banyak
-   * client berbeda mengakses endpoint.
-   */
-  if (buckets.size < 500) {
-    return;
-  }
-
-  for (const [
-    key,
-    bucket
-  ] of buckets) {
     if (
-      now - bucket.startedAt >=
-      RATE_WINDOW_MS
+      parsed &&
+      parsed.error &&
+      typeof parsed.error.message === 'string'
     ) {
-      buckets.delete(key);
+      message = parsed.error.message;
+    }
+  } catch {
+    if (
+      typeof data === 'string' &&
+      data.trim() &&
+      data.length < 2000
+    ) {
+      message = data.trim();
     }
   }
+
+  return message;
 }
 
-function byteLength(value) {
-  return Buffer.byteLength(
-    value,
-    'utf8'
-  );
-}
-
-function isPlainObject(value) {
+function isNotFoundError(status, message = '') {
   return (
-    value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value)
+    status === 404 ||
+    /not found|not_found|404/i.test(message)
   );
 }
 
-function isAllowedMimeType(mimeType) {
-  if (
-    typeof mimeType !== 'string' ||
-    !mimeType
-  ) {
-    return false;
-  }
+function buildGenerateUrl(version, model, streaming = true) {
+  const encodedModel = encodeURIComponent(model);
 
-  const normalized =
-    mimeType
-      .toLowerCase()
-      .split(';')[0]
-      .trim();
-
-  if (
-    ALLOWED_INLINE_MIME_TYPES.has(
-      normalized
-    )
-  ) {
-    return true;
-  }
-
-  return ALLOWED_INLINE_MIME_PREFIXES.some(
-    (prefix) =>
-      normalized.startsWith(prefix)
-  );
-}
-
-function isValidBase64(value) {
-  if (
-    typeof value !== 'string' ||
-    !value
-  ) {
-    return false;
-  }
-
-  /*
-   * Base64 yang dikirim frontend seharusnya
-   * hanya berisi karakter base64 tanpa data URL.
-   */
-  if (
-    value.length % 4 !== 0
-  ) {
-    return false;
-  }
-
-  return /^[A-Za-z0-9+/]*={0,2}$/.test(
-    value
-  );
-}
-
-function estimateBase64Bytes(base64) {
-  const padding =
-    base64.endsWith('==')
-      ? 2
-      : base64.endsWith('=')
-        ? 1
-        : 0;
-
-  return Math.floor(
-    (base64.length * 3) / 4
-  ) - padding;
-}
-
-function sanitizeErrorMessage(
-  status,
-  rawMessage
-) {
-  const message =
-    typeof rawMessage === 'string'
-      ? rawMessage.toLowerCase()
-      : '';
-
-  if (status === 400) {
-    return 'Permintaan ORYVAN tidak valid.';
-  }
-
-  if (
-    status === 401 ||
-    status === 403
-  ) {
-    return 'Konfigurasi akses AI pada server bermasalah.';
-  }
-
-  if (status === 404) {
-    return 'Model AI yang dipilih tidak tersedia.';
-  }
-
-  if (status === 429) {
-    if (
-      message.includes('quota') ||
-      message.includes('resource exhausted')
-    ) {
-      return 'Kuota Gemini sedang tercapai. Coba lagi nanti.';
-    }
-
-    return 'Batas permintaan ORYVAN sedang tercapai. Tunggu sebentar lalu coba lagi.';
-  }
-
-  if (status >= 500) {
-    return 'Layanan AI sedang mengalami gangguan. Coba lagi nanti.';
-  }
-
-  return 'Permintaan ke layanan AI gagal diproses.';
-}
-
-/* ================================
-   REQUEST VALIDATION
-================================ */
-
-function validateTextPart(
-  part,
-  counters
-) {
-  if (
-    !isPlainObject(part)
-  ) {
-    return 'Format bagian pesan tidak valid.';
-  }
-
-  if (
-    typeof part.text !== 'string'
-  ) {
-    return null;
-  }
-
-  if (
-    part.text.length >
-    MAX_TEXT_LENGTH
-  ) {
-    return 'Teks pesan terlalu panjang.';
-  }
-
-  counters.totalTextLength +=
-    part.text.length;
-
-  if (
-    counters.totalTextLength >
-    MAX_TOTAL_TEXT_LENGTH
-  ) {
-    return 'Total teks percakapan terlalu panjang.';
-  }
-
-  return null;
-}
-
-function validateInlineDataPart(
-  part,
-  counters
-) {
-  if (
-    !isPlainObject(part.inline_data)
-  ) {
-    return null;
-  }
-
-  const inlineData =
-    part.inline_data;
-
-  if (
-    typeof inlineData.mime_type !==
-    'string'
-  ) {
-    return 'MIME type lampiran tidak valid.';
-  }
-
-  const mimeType =
-    inlineData.mime_type
-      .toLowerCase()
-      .split(';')[0]
-      .trim();
-
-  if (
-    !isAllowedMimeType(mimeType)
-  ) {
-    return 'Jenis file tersebut tidak didukung.';
-  }
-
-  if (
-    typeof inlineData.data !==
-    'string'
-  ) {
-    return 'Data lampiran tidak valid.';
-  }
-
-  if (
-    !isValidBase64(
-      inlineData.data
-    )
-  ) {
-    return 'Format data lampiran tidak valid.';
-  }
-
-  const estimatedBytes =
-    estimateBase64Bytes(
-      inlineData.data
+  if (streaming) {
+    return (
+      `https://generativelanguage.googleapis.com/` +
+      `${version}/models/${encodedModel}:streamGenerateContent` +
+      `?alt=sse`
     );
-
-  if (
-    estimatedBytes >
-    MAX_INLINE_DATA_BYTES
-  ) {
-    return 'Ukuran lampiran terlalu besar.';
   }
 
-  counters.inlineAttachments += 1;
-
-  if (
-    counters.inlineAttachments >
-    MAX_INLINE_ATTACHMENTS
-  ) {
-    return 'Jumlah lampiran dalam satu permintaan terlalu banyak.';
-  }
-
-  return null;
+  return (
+    `https://generativelanguage.googleapis.com/` +
+    `${version}/models/${encodedModel}:generateContent`
+  );
 }
 
-function validatePart(
-  part,
-  counters
-) {
-  if (
-    !isPlainObject(part)
-  ) {
-    return 'Format part pesan tidak valid.';
-  }
+async function callGemini({
+  version,
+  model,
+  requestBody,
+  apiKey,
+  signal,
+  streaming
+}) {
+  const response = await fetch(
+    buildGenerateUrl(version, model, streaming),
+    {
+      method: 'POST',
 
-  const keys =
-    Object.keys(part);
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey
+      },
 
-  /*
-   * Part harus menggunakan format yang
-   * dikenal Gemini. Jangan meneruskan objek
-   * arbitrary dari client.
-   */
-  const allowedKeys = new Set([
-    'text',
-    'inline_data'
-  ]);
+      body: JSON.stringify(requestBody),
 
-  for (const key of keys) {
-    if (!allowedKeys.has(key)) {
-      return 'Format pesan mengandung properti yang tidak didukung.';
+      signal
     }
-  }
+  );
 
-  if (
-    typeof part.text === 'string'
-  ) {
-    const textError =
-      validateTextPart(
-        part,
-        counters
-      );
-
-    if (textError) {
-      return textError;
-    }
-  }
-
-  if (
-    part.inline_data
-  ) {
-    const attachmentError =
-      validateInlineDataPart(
-        part,
-        counters
-      );
-
-    if (attachmentError) {
-      return attachmentError;
-    }
-  }
-
-  if (
-    typeof part.text !== 'string' &&
-    !part.inline_data
-  ) {
-    return 'Part pesan tidak memiliki konten yang didukung.';
-  }
-
-  return null;
-}
-
-function validateContents(
-  contents
-) {
-  if (
-    !Array.isArray(contents) ||
-    contents.length === 0
-  ) {
-    return {
-      error:
-        'Isi percakapan tidak valid.'
-    };
-  }
-
-  if (
-    contents.length >
-    MAX_CONTENTS
-  ) {
-    return {
-      error:
-        'Percakapan terlalu panjang.'
-    };
-  }
-
-  const counters = {
-    totalTextLength: 0,
-    inlineAttachments: 0
-  };
-
-  const validated = [];
-
-  for (
-    const message of contents
-  ) {
-    if (
-      !isPlainObject(message)
-    ) {
-      return {
-        error:
-          'Format pesan percakapan tidak valid.'
-      };
-    }
-
-    /*
-     * Gemini menggunakan:
-     * user
-     * model
-     *
-     * Jangan izinkan client mengirim
-     * system/developer role sendiri.
-     */
-    if (
-      message.role !== 'user' &&
-      message.role !== 'model'
-    ) {
-      return {
-        error:
-          'Role pesan tidak valid.'
-      };
-    }
-
-    if (
-      !Array.isArray(
-        message.parts
-      )
-    ) {
-      return {
-        error:
-          'Format parts pesan tidak valid.'
-      };
-    }
-
-    if (
-      message.parts.length === 0
-    ) {
-      return {
-        error:
-          'Pesan tidak memiliki konten.'
-      };
-    }
-
-    if (
-      message.parts.length >
-      MAX_PARTS_PER_MESSAGE
-    ) {
-      return {
-        error:
-          'Terlalu banyak lampiran atau bagian dalam satu pesan.'
-      };
-    }
-
-    const cleanParts = [];
-
-    for (
-      const part of message.parts
-    ) {
-      const partError =
-        validatePart(
-          part,
-          counters
-        );
-
-      if (partError) {
-        return {
-          error: partError
-        };
-      }
-
-      /*
-       * Hanya salin field yang memang
-       * diperlukan Gemini.
-       */
-      if (
-        typeof part.text ===
-        'string'
-      ) {
-        cleanParts.push({
-          text: part.text
-        });
-      } else if (
-        part.inline_data
-      ) {
-        cleanParts.push({
-          inline_data: {
-            mime_type:
-              part.inline_data
-                .mime_type
-                .toLowerCase()
-                .split(';')[0]
-                .trim(),
-
-            data:
-              part.inline_data
-                .data
-          }
-        });
-      }
-    }
-
-    validated.push({
-      role: message.role,
-      parts: cleanParts
-    });
-  }
+  const data = await response.text();
 
   return {
-    contents: validated
+    response,
+    data,
+    message: response.ok
+      ? ''
+      : parseGoogleError(data, response.status)
   };
 }
 
-/* ================================
-   GEMINI ERROR PARSING
-================================ */
+function sendSSE(res, payload) {
+  res.statusCode = 200;
 
-async function readErrorResponse(
-  response
-) {
+  res.setHeader(
+    'Content-Type',
+    'text/event-stream; charset=utf-8'
+  );
+
+  res.setHeader(
+    'Cache-Control',
+    'no-cache, no-transform'
+  );
+
+  res.setHeader(
+    'Connection',
+    'keep-alive'
+  );
+
+  return res.end(
+    `data: ${JSON.stringify(payload)}\n\n`
+  );
+}
+
+function tryParseJSON(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
   try {
-    const text =
-      await response.text();
-
-    if (!text) {
-      return '';
-    }
-
-    try {
-      const parsed =
-        JSON.parse(text);
-
-      if (
-        parsed?.error?.message
-      ) {
-        return String(
-          parsed.error.message
-        );
-      }
-    } catch {
-      /*
-       * Bukan JSON.
-       */
-    }
-
-    return text.slice(0, 500);
+    return JSON.parse(value);
   } catch {
-    return '';
+    return null;
   }
 }
 
-/* ================================
-   MAIN HANDLER
-================================ */
+function createFallbackPayload(data) {
+  const parsed = tryParseJSON(data);
 
-export default async function handler(
-  req,
-  res
-) {
-  setSecurityHeaders(res);
-
-  /*
-   * Hanya POST.
-   */
-  if (
-    req.method !== 'POST'
-  ) {
-    res.setHeader(
-      'Allow',
-      'POST'
-    );
-
-    return sendJson(
-      res,
-      405,
-      {
-        error:
-          'Method Not Allowed'
+  if (!parsed) {
+    return {
+      error: {
+        message:
+          'Gemini mengembalikan respons yang tidak dapat dibaca.'
       }
-    );
+    };
   }
 
-  /*
-   * API key hanya dibaca dari server.
-   */
+  return parsed;
+}
+
+function validateContents(contents) {
+  if (!Array.isArray(contents)) {
+    return false;
+  }
+
+  if (contents.length === 0) {
+    return false;
+  }
+
+  return contents.every((item) => {
+    return (
+      item &&
+      typeof item === 'object' &&
+      typeof item.role === 'string' &&
+      Array.isArray(item.parts)
+    );
+  });
+}
+
+function sanitizeContents(contents) {
+  return contents
+    .slice(-MAX_CONTENTS)
+    .map((item) => {
+      const role =
+        item.role === 'model'
+          ? 'model'
+          : 'user';
+
+      const parts = item.parts
+        .slice(0, 20)
+        .map((part) => {
+          if (
+            part &&
+            typeof part.text === 'string'
+          ) {
+            return {
+              text: part.text.slice(0, 20_000)
+            };
+          }
+
+          if (
+            part &&
+            part.inline_data &&
+            typeof part.inline_data === 'object'
+          ) {
+            const inline = part.inline_data;
+
+            if (
+              typeof inline.data !== 'string' ||
+              typeof inline.mime_type !== 'string'
+            ) {
+              throw new Error(
+                'Format lampiran tidak valid.'
+              );
+            }
+
+            const mime =
+              inline.mime_type
+                .trim()
+                .toLowerCase();
+
+            if (
+              !mime.startsWith('image/') &&
+              mime !== 'application/pdf' &&
+              !mime.startsWith('text/')
+            ) {
+              throw new Error(
+                'Tipe lampiran tidak didukung.'
+              );
+            }
+
+            const estimatedBytes =
+              Math.floor(
+                inline.data.replace(/\s/g, '').length *
+                0.75
+              );
+
+            if (
+              estimatedBytes >
+              2 * 1024 * 1024
+            ) {
+              throw new Error(
+                'Lampiran terlalu besar. Maksimal sekitar 2 MB per bagian.'
+              );
+            }
+
+            return {
+              inline_data: {
+                mime_type: mime,
+                data: inline.data
+              }
+            };
+          }
+
+          throw new Error(
+            'Bagian pesan tidak valid.'
+          );
+        });
+
+      return {
+        role,
+        parts
+      };
+    });
+}
+
+export default async function handler(req, res) {
+  setSecurityHeaders(res);
+
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+
+    return sendJson(res, 405, {
+      error: 'Method Not Allowed'
+    });
+  }
+
   const apiKey =
     process.env.GEMINI_API_KEY;
 
-  if (
-    typeof apiKey !== 'string' ||
-    !apiKey.trim()
-  ) {
-    console.error(
-      'GEMINI_API_KEY tidak tersedia di environment server.'
-    );
-
-    return sendJson(
-      res,
-      500,
-      {
-        error:
-          'Konfigurasi server belum lengkap.'
-      }
-    );
+  if (!apiKey) {
+    return sendJson(res, 500, {
+      error:
+        'Kredensial server belum dikonfigurasi.'
+    });
   }
 
-  /*
-   * Basic rate limit.
-   */
   const clientKey =
     getClientKey(req);
 
-  if (
-    rateLimited(clientKey)
-  ) {
-    return sendJson(
-      res,
-      429,
-      {
-        error:
-          'Batas permintaan ORYVAN tercapai. Tunggu sebentar lalu coba lagi.'
-      }
-    );
-  }
-
-  /*
-   * Periksa Content-Length jika tersedia.
-   *
-   * Ini membantu menolak request besar
-   * sebelum diproses lebih lanjut.
-   */
-  const contentLengthHeader =
-    req.headers?.['content-length'];
-
-  if (
-    contentLengthHeader
-  ) {
-    const contentLength =
-      Number(
-        contentLengthHeader
-      );
-
-    if (
-      Number.isFinite(
-        contentLength
-      ) &&
-      contentLength >
-        MAX_BODY_BYTES
-    ) {
-      return sendJson(
-        res,
-        413,
-        {
-          error:
-            'Permintaan terlalu besar. Kurangi ukuran pesan atau lampiran.'
-        }
-      );
-    }
+  if (rateLimited(clientKey)) {
+    return sendJson(res, 429, {
+      error:
+        'Terlalu banyak permintaan. Tunggu sebentar lalu coba lagi.'
+    });
   }
 
   try {
     const body =
       req.body &&
-      typeof req.body ===
-        'object'
+      typeof req.body === 'object'
         ? req.body
-        : null;
+        : {};
 
-    if (
-      !body ||
-      Array.isArray(body)
-    ) {
-      return sendJson(
-        res,
-        400,
-        {
-          error:
-            'Format permintaan tidak valid.'
-        }
-      );
-    }
-
-    /*
-     * Pastikan body tidak terlalu besar.
-     *
-     * Ini tetap dilakukan karena Content-Length
-     * tidak selalu tersedia.
-     */
     let serialized;
 
     try {
-      serialized =
-        JSON.stringify(body);
+      serialized = JSON.stringify(body);
     } catch {
-      return sendJson(
-        res,
-        400,
-        {
-          error:
-            'Format permintaan tidak valid.'
-        }
-      );
+      return sendJson(res, 400, {
+        error:
+          'Format permintaan tidak valid.'
+      });
     }
 
     if (
-      byteLength(serialized) >
-      MAX_BODY_BYTES
+      Buffer.byteLength(
+        serialized,
+        'utf8'
+      ) > MAX_BODY_BYTES
     ) {
-      return sendJson(
-        res,
-        413,
-        {
-          error:
-            'Permintaan terlalu besar. Kurangi ukuran pesan atau lampiran.'
-        }
-      );
+      return sendJson(res, 413, {
+        error:
+          'Permintaan terlalu besar. Kurangi ukuran pesan atau lampiran.'
+      });
     }
 
-    /*
-     * Model allowlist.
-     */
     const requestedModel =
-      typeof body.model ===
-      'string'
+      typeof body.model === 'string'
         ? body.model.trim()
         : '';
 
@@ -922,35 +447,33 @@ export default async function handler(
         ? requestedModel
         : DEFAULT_MODEL;
 
-    /*
-     * Validasi conversation.
-     *
-     * Hanya field yang diperlukan yang
-     * diteruskan ke Gemini.
-     */
-    const validation =
-      validateContents(
+    if (
+      !validateContents(
         body.contents
-      );
-
-    if (validation.error) {
-      return sendJson(
-        res,
-        400,
-        {
-          error:
-            validation.error
-        }
-      );
+      )
+    ) {
+      return sendJson(res, 400, {
+        error:
+          'Isi percakapan tidak valid.'
+      });
     }
 
-    const contents =
-      validation.contents;
+    let contents;
 
-    /*
-     * System instruction selalu berasal
-     * dari backend.
-     */
+    try {
+      contents =
+        sanitizeContents(
+          body.contents
+        );
+    } catch (error) {
+      return sendJson(res, 400, {
+        error: getErrorMessage(
+          error,
+          'Lampiran atau isi pesan tidak valid.'
+        )
+      });
+    }
+
     const requestBody = {
       systemInstruction: {
         parts: [
@@ -965,12 +488,9 @@ export default async function handler(
     };
 
     /*
-     * Code Execution tetap OFF secara default.
+     * Code Execution bersifat opsional.
      *
-     * Frontend hanya dapat mengaktifkannya
-     * dengan mengirim:
-     *
-     * codeExecution: true
+     * Tidak aktif secara default.
      */
     if (
       body.codeExecution === true
@@ -982,263 +502,222 @@ export default async function handler(
       ];
     }
 
-    /*
-     * Abort controller digunakan untuk
-     * mencegah request menggantung terlalu lama.
-     */
     const controller =
       new AbortController();
 
     const timeout =
-      setTimeout(
-        () => {
-          controller.abort();
-        },
-        55_000
-      );
-
-    let response;
+      setTimeout(() => {
+        controller.abort();
+      }, 55_000);
 
     try {
-      response =
-        await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-            model
-          )}:streamGenerateContent?alt=sse`,
-          {
-            method: 'POST',
+      /*
+       * ==========================================================
+       * PERCOBAAN 1
+       * Gemini API v1beta + streaming
+       * ==========================================================
+       */
+      let result =
+        await callGemini({
+          version: 'v1beta',
+          model,
+          requestBody,
+          apiKey,
+          signal:
+            controller.signal,
+          streaming: true
+        });
 
-            headers: {
-              'Content-Type':
-                'application/json',
-
-              'Accept':
-                'text/event-stream',
-
-              'x-goog-api-key':
-                apiKey
-            },
-
-            body:
-              JSON.stringify(
-                requestBody
-              ),
-
-            signal:
-              controller.signal
-          }
-        );
-    } catch (error) {
-      if (
-        error?.name ===
-        'AbortError'
-      ) {
-        return sendJson(
+      if (result.response.ok) {
+        return sendStreamingResponse(
           res,
-          504,
-          {
-            error:
-              'Permintaan ke Gemini terlalu lama dan dihentikan.'
-          }
+          result.data
         );
       }
 
-      console.error(
-        'ORYVAN Gemini connection error:',
-        error
-      );
+      /*
+       * ==========================================================
+       * PERCOBAAN 2
+       *
+       * Jika 404, coba endpoint v1.
+       *
+       * Ini membantu jika model tersedia tetapi endpoint
+       * v1beta tidak cocok dengan konfigurasi API saat ini.
+       * ==========================================================
+       */
+      if (
+        isNotFoundError(
+          result.response.status,
+          result.message
+        )
+      ) {
+        result =
+          await callGemini({
+            version: 'v1',
+            model,
+            requestBody,
+            apiKey,
+            signal:
+              controller.signal,
+            streaming: true
+          });
+
+        if (result.response.ok) {
+          return sendStreamingResponse(
+            res,
+            result.data
+          );
+        }
+      }
+
+      /*
+       * ==========================================================
+       * PERCOBAAN 3
+       *
+       * Jika masih 404, gunakan generateContent biasa.
+       *
+       * Respons JSON akan dibungkus menjadi satu event SSE
+       * sehingga frontend ORYVAN tetap kompatibel.
+       * ==========================================================
+       */
+      if (
+        isNotFoundError(
+          result.response.status,
+          result.message
+        )
+      ) {
+        const fallbackVersions =
+          ['v1beta', 'v1'];
+
+        for (
+          const version
+          of fallbackVersions
+        ) {
+          const fallback =
+            await callGemini({
+              version,
+              model,
+              requestBody,
+              apiKey,
+              signal:
+                controller.signal,
+              streaming: false
+            });
+
+          if (
+            fallback.response.ok
+          ) {
+            const payload =
+              createFallbackPayload(
+                fallback.data
+              );
+
+            return sendSSE(
+              res,
+              payload
+            );
+          }
+
+          /*
+           * Jika salah satu fallback bukan 404,
+           * hentikan pencarian agar error sebenarnya
+           * tidak tertutup.
+           */
+          if (
+            !isNotFoundError(
+              fallback.response.status,
+              fallback.message
+            )
+          ) {
+            return sendJson(
+              res,
+              fallback.response.status,
+              {
+                error:
+                  fallback.message
+              }
+            );
+          }
+        }
+      }
+
+      /*
+       * ==========================================================
+       * ERROR AKHIR
+       * ==========================================================
+       */
+
+      if (
+        isNotFoundError(
+          result.response.status,
+          result.message
+        )
+      ) {
+        return sendJson(res, 404, {
+          error:
+            `Model "${model}" tidak ditemukan atau ` +
+            `tidak tersedia untuk API key/project server saat ini. ` +
+            `Pastikan model tersebut tersedia pada Gemini API.`
+        });
+      }
 
       return sendJson(
         res,
-        502,
+        result.response.status,
         {
           error:
-            'Tidak dapat terhubung ke layanan AI.'
+            result.message ||
+            `Gemini API error (${result.response.status})`
         }
       );
     } finally {
       clearTimeout(timeout);
     }
-
-    /*
-     * Gemini mengembalikan error non-2xx
-     * sebagai response biasa.
-     */
-    if (
-      !response.ok
-    ) {
-      const rawError =
-        await readErrorResponse(
-          response
-        );
-
-      const safeMessage =
-        sanitizeErrorMessage(
-          response.status,
-          rawError
-        );
-
-      /*
-       * Detail error hanya dicatat
-       * di server untuk debugging.
-       */
-      console.error(
-        'Gemini API error:',
-        response.status,
-        rawError
-      );
-
-      return sendJson(
-        res,
-        response.status,
-        {
-          error:
-            safeMessage
-        }
-      );
-    }
-
-    /*
-     * Pastikan Gemini benar-benar
-     * memberikan stream.
-     */
-    if (
-      !response.body
-    ) {
-      return sendJson(
-        res,
-        502,
-        {
-          error:
-            'Gemini tidak mengembalikan stream respons.'
-        }
-      );
-    }
-
-    /*
-     * TRUE STREAMING
-     *
-     * Versi sebelumnya menggunakan:
-     *
-     * await response.text()
-     *
-     * sehingga backend menunggu seluruh
-     * respons selesai terlebih dahulu.
-     *
-     * Sekarang chunk dari Gemini langsung
-     * diteruskan ke browser.
-     */
-    res.statusCode = 200;
-
-    res.setHeader(
-      'Content-Type',
-      'text/event-stream; charset=utf-8'
-    );
-
-    res.setHeader(
-      'Cache-Control',
-      'no-cache, no-transform'
-    );
-
-    res.setHeader(
-      'Connection',
-      'keep-alive'
-    );
-
-    /*
-     * Jangan buffering response jika
-     * platform mendukung header ini.
-     */
-    res.setHeader(
-      'X-Accel-Buffering',
-      'no'
-    );
-
-    const reader =
-      response.body.getReader();
-
-    try {
-      while (true) {
-        const {
-          done,
-          value
-        } =
-          await reader.read();
-
-        if (done) {
-          break;
-        }
-
-        /*
-         * Node/Vercel response.end()
-         * tidak digunakan di sini sampai
-         * seluruh stream selesai.
-         *
-         * write() meneruskan setiap chunk
-         * sesegera mungkin.
-         */
-        res.write(
-          Buffer.from(value)
-        );
-      }
-    } catch (error) {
-      /*
-       * Jika client menutup koneksi,
-       * hentikan pembacaan stream.
-       */
-      try {
-        await reader.cancel();
-      } catch {
-        // Tidak perlu melakukan apa-apa.
-      }
-
-      console.error(
-        'ORYVAN stream error:',
-        error
-      );
-
-      /*
-       * Jika header sudah dikirim, jangan
-       * mencoba mengirim JSON error karena
-       * response sudah berupa SSE.
-       */
-      if (!res.writableEnded) {
-        res.end();
-      }
-
-      return;
-    }
-
-    return res.end();
   } catch (error) {
+    if (
+      error?.name === 'AbortError'
+    ) {
+      return sendJson(res, 504, {
+        error:
+          'Permintaan ke Gemini terlalu lama dan dihentikan.'
+      });
+    }
+
     console.error(
       'ORYVAN backend error:',
       error
     );
 
-    /*
-     * Jangan membocorkan error internal
-     * ke client.
-     */
-    if (
-      res.headersSent
-    ) {
-      if (
-        !res.writableEnded
-      ) {
-        res.end();
-      }
-
-      return;
-    }
-
-    return sendJson(
-      res,
-      500,
-      {
-        error:
+    return sendJson(res, 500, {
+      error:
+        getErrorMessage(
+          error,
           'Terjadi kesalahan pada backend ORYVAN.'
-      }
-    );
+        )
+    });
   }
-    }
+}
+
+function sendStreamingResponse(
+  res,
+  data
+) {
+  res.statusCode = 200;
+
+  res.setHeader(
+    'Content-Type',
+    'text/event-stream; charset=utf-8'
+  );
+
+  res.setHeader(
+    'Cache-Control',
+    'no-cache, no-transform'
+  );
+
+  res.setHeader(
+    'Connection',
+    'keep-alive'
+  );
+
+  return res.end(data);
+  }
