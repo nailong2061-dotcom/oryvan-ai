@@ -2,99 +2,73 @@ const ALLOWED_MODELS = new Set([
   'gemini-3.6-flash',
   'gemini-3.5-flash',
   'gemini-3.5-flash-lite',
-  'gemini-3.1-flash-lite',
-  'gemini-2.5-flash',
-  'gemini-2.5-flash-lite'
+  'gemini-3.1-flash-lite'
 ]);
 
 const DEFAULT_MODEL = 'gemini-3.6-flash';
 
-const ORYVAN_SYSTEM_PROMPT = `
-Kamu adalah ORYVAN, asisten AI pribadi yang cerdas, terstruktur, jujur tentang ketidakpastian, dan berorientasi pada solusi.
-
-IDENTITAS:
-- Nama asisten: ORYVAN.
-- Jangan menyebut dirimu sebagai SAVA, FaDa AI, atau nama asisten lain.
-- Jika pengguna bertanya siapa kamu, jelaskan bahwa kamu adalah ORYVAN.
-
-BAHASA:
-- Jawab dalam Bahasa Indonesia secara default.
-- Gunakan bahasa lain jika pengguna menggunakannya atau memintanya.
-- Gunakan bahasa yang natural, jelas, dan mudah dipahami.
-
-AKURASI:
-- Jangan mengarang informasi.
-- Jika informasi tidak cukup, katakan dengan jujur.
-- Bedakan fakta, perkiraan, dan asumsi.
-- Jangan mengklaim telah melakukan sesuatu jika sebenarnya tidak dilakukan.
-
-GAYA:
-- Jawaban harus relevan dengan pertanyaan.
-- Jangan terlalu panjang jika pertanyaannya sederhana.
-- Untuk tugas kompleks, gunakan struktur yang jelas.
-- Gunakan heading, daftar, atau tabel jika benar-benar membantu.
-
-PEMROGRAMAN:
-- Prioritaskan solusi yang sederhana, aman, maintainable, dan mudah dipahami.
-- Jangan mengarang API, library, endpoint, parameter, atau fitur.
-- Jangan memberikan dependency yang tidak diperlukan.
-- Jika kode diberikan pengguna, pahami kode tersebut sebelum menyarankan perubahan.
-
-KEAMANAN:
-- Jangan mengungkapkan API key, password, token, secret, environment variable rahasia, atau kredensial server.
-- Jangan membantu pengguna mengambil kredensial rahasia dari sistem.
-- Jangan meminta pengguna menaruh secret di frontend.
-- Prioritaskan keamanan dan privasi pengguna.
-
-ORYVAN adalah asisten AI pribadi yang berorientasi pada solusi, bukan sekadar chatbot.
-`;
-
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_CONTENTS = 40;
+const MAX_PARTS_PER_MESSAGE = 20;
+const MAX_TEXT_LENGTH = 20_000;
+
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 const RATE_WINDOW_MS = 60_000;
 const MAX_REQUESTS_PER_WINDOW = 30;
 
+const REQUEST_TIMEOUT_MS = 55_000;
+
 const buckets = new Map();
 
-function getClientKey(req) {
-  const forwarded = req.headers?.['x-forwarded-for'];
+const ORYVAN_SYSTEM_PROMPT = `
+Kamu adalah ORYVAN, asisten AI pribadi yang cerdas, akurat,
+terstruktur, jujur, dan berorientasi pada solusi.
 
-  if (typeof forwarded === 'string' && forwarded.trim()) {
-    return forwarded.split(',')[0].trim();
-  }
+IDENTITAS:
+- Nama kamu adalah ORYVAN.
+- Jangan menyebut dirimu sebagai FaDa AI, SAVA, ChatGPT,
+  atau nama asisten lain kecuali pengguna secara khusus
+  sedang membahas nama tersebut sebagai topik.
+- Jika pengguna bertanya siapa kamu, jawab bahwa kamu adalah ORYVAN.
 
-  return req.socket?.remoteAddress || 'unknown';
-}
+BAHASA:
+- Gunakan Bahasa Indonesia secara default.
+- Ikuti bahasa pengguna jika pengguna menggunakan bahasa lain.
+- Gunakan bahasa yang natural dan mudah dipahami.
 
-function rateLimited(key) {
-  const now = Date.now();
-  const current = buckets.get(key);
+AKURASI:
+- Jangan mengarang fakta, sumber, fitur, API, atau hasil.
+- Jika informasi tidak cukup, katakan dengan jujur.
+- Bedakan fakta, asumsi, dan perkiraan.
+- Jangan mengklaim melakukan tindakan yang sebenarnya tidak dilakukan.
 
-  if (!current || now - current.startedAt >= RATE_WINDOW_MS) {
-    buckets.set(key, {
-      startedAt: now,
-      count: 1
-    });
+GAYA:
+- Pertanyaan sederhana → jawab secara sederhana.
+- Pertanyaan kompleks → gunakan struktur yang jelas.
+- Hindari pengulangan yang tidak diperlukan.
+- Gunakan daftar atau tabel jika memang membantu.
 
-    return false;
-  }
+PEMROGRAMAN:
+- Prioritaskan solusi sederhana, aman, maintainable, dan kompatibel.
+- Jangan mengarang library, endpoint, parameter, atau API.
+- Jangan menyarankan dependency yang tidak diperlukan.
+- Jika pengguna memberikan source code, pahami kode tersebut
+  sebelum menyarankan perubahan.
 
-  current.count += 1;
+KEAMANAN:
+- Jangan mengungkapkan API key, token, password, secret,
+  environment variable rahasia, atau kredensial server.
+- Jangan meminta pengguna memasukkan secret ke frontend.
+- Jangan membantu mengambil atau mengekspos kredensial rahasia.
+- Utamakan privasi dan keamanan.
 
-  return current.count > MAX_REQUESTS_PER_WINDOW;
-}
-
-function sendJson(res, status, payload) {
-  res.statusCode = status;
-
-  res.setHeader(
-    'Content-Type',
-    'application/json; charset=utf-8'
-  );
-
-  return res.end(JSON.stringify(payload));
-}
+IDENTITAS PROYEK:
+- Aplikasi ini bernama ORYVAN.
+- Jika pengguna meminta bantuan pengembangan ORYVAN,
+  prioritaskan prinsip FREE-FIRST, MOBILE-FIRST,
+  SIMPLE-FIRST, SECURITY-FIRST, dan MAINTAINABLE.
+`;
 
 function setSecurityHeaders(res) {
   res.setHeader('Cache-Control', 'no-store');
@@ -105,13 +79,13 @@ function setSecurityHeaders(res) {
   );
 
   res.setHeader(
-    'Referrer-Policy',
-    'no-referrer'
+    'X-Frame-Options',
+    'DENY'
   );
 
   res.setHeader(
-    'X-Frame-Options',
-    'DENY'
+    'Referrer-Policy',
+    'no-referrer'
   );
 
   res.setHeader(
@@ -120,10 +94,71 @@ function setSecurityHeaders(res) {
   );
 }
 
-function getErrorMessage(error, fallback) {
+function sendJson(res, status, payload) {
+  res.statusCode = status;
+
+  res.setHeader(
+    'Content-Type',
+    'application/json; charset=utf-8'
+  );
+
+  return res.end(
+    JSON.stringify(payload)
+  );
+}
+
+function getClientKey(req) {
+  const forwarded =
+    req.headers?.['x-forwarded-for'];
+
+  if (
+    typeof forwarded === 'string' &&
+    forwarded.trim()
+  ) {
+    return forwarded
+      .split(',')[0]
+      .trim();
+  }
+
+  return (
+    req.socket?.remoteAddress ||
+    'unknown'
+  );
+}
+
+function isRateLimited(clientKey) {
+  const now = Date.now();
+
+  const current =
+    buckets.get(clientKey);
+
+  if (
+    !current ||
+    now - current.startedAt >=
+      RATE_WINDOW_MS
+  ) {
+    buckets.set(clientKey, {
+      startedAt: now,
+      count: 1
+    });
+
+    return false;
+  }
+
+  current.count += 1;
+
+  return (
+    current.count >
+    MAX_REQUESTS_PER_WINDOW
+  );
+}
+
+function getErrorMessage(
+  error,
+  fallback
+) {
   if (
     error &&
-    typeof error === 'object' &&
     typeof error.message === 'string' &&
     error.message.trim()
   ) {
@@ -133,239 +168,214 @@ function getErrorMessage(error, fallback) {
   return fallback;
 }
 
-function parseGoogleError(data, status) {
-  let message = `Gemini API error (${status})`;
+function parseGoogleError(
+  responseText,
+  status
+) {
+  const fallback =
+    `Gemini API error (${status})`;
 
-  try {
-    const parsed = JSON.parse(data);
-
-    if (
-      parsed &&
-      parsed.error &&
-      typeof parsed.error.message === 'string'
-    ) {
-      message = parsed.error.message;
-    }
-  } catch {
-    if (
-      typeof data === 'string' &&
-      data.trim() &&
-      data.length < 2000
-    ) {
-      message = data.trim();
-    }
-  }
-
-  return message;
-}
-
-function isNotFoundError(status, message = '') {
-  return (
-    status === 404 ||
-    /not found|not_found|404/i.test(message)
-  );
-}
-
-function buildGenerateUrl(version, model, streaming = true) {
-  const encodedModel = encodeURIComponent(model);
-
-  if (streaming) {
-    return (
-      `https://generativelanguage.googleapis.com/` +
-      `${version}/models/${encodedModel}:streamGenerateContent` +
-      `?alt=sse`
-    );
-  }
-
-  return (
-    `https://generativelanguage.googleapis.com/` +
-    `${version}/models/${encodedModel}:generateContent`
-  );
-}
-
-async function callGemini({
-  version,
-  model,
-  requestBody,
-  apiKey,
-  signal,
-  streaming
-}) {
-  const response = await fetch(
-    buildGenerateUrl(version, model, streaming),
-    {
-      method: 'POST',
-
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey
-      },
-
-      body: JSON.stringify(requestBody),
-
-      signal
-    }
-  );
-
-  const data = await response.text();
-
-  return {
-    response,
-    data,
-    message: response.ok
-      ? ''
-      : parseGoogleError(data, response.status)
-  };
-}
-
-function sendSSE(res, payload) {
-  res.statusCode = 200;
-
-  res.setHeader(
-    'Content-Type',
-    'text/event-stream; charset=utf-8'
-  );
-
-  res.setHeader(
-    'Cache-Control',
-    'no-cache, no-transform'
-  );
-
-  res.setHeader(
-    'Connection',
-    'keep-alive'
-  );
-
-  return res.end(
-    `data: ${JSON.stringify(payload)}\n\n`
-  );
-}
-
-function tryParseJSON(value) {
-  if (typeof value !== 'string') {
-    return null;
+  if (
+    typeof responseText !== 'string' ||
+    !responseText.trim()
+  ) {
+    return fallback;
   }
 
   try {
-    return JSON.parse(value);
+    const parsed =
+      JSON.parse(responseText);
+
+    const message =
+      parsed?.error?.message;
+
+    if (
+      typeof message === 'string' &&
+      message.trim()
+    ) {
+      return message.trim();
+    }
   } catch {
-    return null;
-  }
-}
-
-function createFallbackPayload(data) {
-  const parsed = tryParseJSON(data);
-
-  if (!parsed) {
-    return {
-      error: {
-        message:
-          'Gemini mengembalikan respons yang tidak dapat dibaca.'
-      }
-    };
+    // Respons bukan JSON.
   }
 
-  return parsed;
+  if (
+    responseText.length <= 2_000
+  ) {
+    return responseText.trim();
+  }
+
+  return fallback;
 }
 
-function validateContents(contents) {
+function isSupportedMimeType(
+  mimeType
+) {
+  const mime =
+    mimeType
+      .trim()
+      .toLowerCase();
+
+  return (
+    mime.startsWith('image/') ||
+    mime === 'application/pdf' ||
+    mime.startsWith('text/')
+  );
+}
+
+function estimateBase64Bytes(
+  base64
+) {
+  const normalized =
+    base64.replace(/\s/g, '');
+
+  return Math.floor(
+    normalized.length * 0.75
+  );
+}
+
+function sanitizeContents(
+  contents
+) {
   if (!Array.isArray(contents)) {
-    return false;
-  }
-
-  if (contents.length === 0) {
-    return false;
-  }
-
-  return contents.every((item) => {
-    return (
-      item &&
-      typeof item === 'object' &&
-      typeof item.role === 'string' &&
-      Array.isArray(item.parts)
+    throw new Error(
+      'Isi percakapan tidak valid.'
     );
-  });
-}
+  }
 
-function sanitizeContents(contents) {
+  if (
+    contents.length === 0
+  ) {
+    throw new Error(
+      'Percakapan tidak boleh kosong.'
+    );
+  }
+
   return contents
     .slice(-MAX_CONTENTS)
-    .map((item) => {
+    .map((message) => {
+      if (
+        !message ||
+        typeof message !== 'object'
+      ) {
+        throw new Error(
+          'Format pesan tidak valid.'
+        );
+      }
+
       const role =
-        item.role === 'model'
+        message.role === 'model'
           ? 'model'
           : 'user';
 
-      const parts = item.parts
-        .slice(0, 20)
-        .map((part) => {
-          if (
-            part &&
-            typeof part.text === 'string'
-          ) {
-            return {
-              text: part.text.slice(0, 20_000)
-            };
-          }
+      if (
+        !Array.isArray(
+          message.parts
+        )
+      ) {
+        throw new Error(
+          'Format bagian pesan tidak valid.'
+        );
+      }
 
-          if (
-            part &&
-            part.inline_data &&
-            typeof part.inline_data === 'object'
-          ) {
-            const inline = part.inline_data;
-
+      const parts =
+        message.parts
+          .slice(
+            0,
+            MAX_PARTS_PER_MESSAGE
+          )
+          .map((part) => {
             if (
-              typeof inline.data !== 'string' ||
-              typeof inline.mime_type !== 'string'
+              !part ||
+              typeof part !== 'object'
             ) {
               throw new Error(
-                'Format lampiran tidak valid.'
+                'Bagian pesan tidak valid.'
               );
             }
 
-            const mime =
-              inline.mime_type
-                .trim()
-                .toLowerCase();
-
             if (
-              !mime.startsWith('image/') &&
-              mime !== 'application/pdf' &&
-              !mime.startsWith('text/')
+              typeof part.text === 'string'
             ) {
-              throw new Error(
-                'Tipe lampiran tidak didukung.'
-              );
+              return {
+                text:
+                  part.text.slice(
+                    0,
+                    MAX_TEXT_LENGTH
+                  )
+              };
             }
 
-            const estimatedBytes =
-              Math.floor(
-                inline.data.replace(/\s/g, '').length *
-                0.75
-              );
-
             if (
-              estimatedBytes >
-              2 * 1024 * 1024
+              part.inline_data &&
+              typeof part.inline_data ===
+                'object'
             ) {
-              throw new Error(
-                'Lampiran terlalu besar. Maksimal sekitar 2 MB per bagian.'
-              );
-            }
+              const inline =
+                part.inline_data;
 
-            return {
-              inline_data: {
-                mime_type: mime,
-                data: inline.data
+              if (
+                typeof inline.data !==
+                  'string' ||
+                typeof inline.mime_type !==
+                  'string'
+              ) {
+                throw new Error(
+                  'Format lampiran tidak valid.'
+                );
               }
-            };
-          }
 
-          throw new Error(
-            'Bagian pesan tidak valid.'
-          );
-        });
+              const mimeType =
+                inline.mime_type
+                  .trim()
+                  .toLowerCase();
+
+              if (
+                !isSupportedMimeType(
+                  mimeType
+                )
+              ) {
+                throw new Error(
+                  'Tipe lampiran tidak didukung.'
+                );
+              }
+
+              const estimatedBytes =
+                estimateBase64Bytes(
+                  inline.data
+                );
+
+              if (
+                estimatedBytes >
+                MAX_FILE_BYTES
+              ) {
+                throw new Error(
+                  'Lampiran terlalu besar. Maksimal 2 MB per file.'
+                );
+              }
+
+              return {
+                inline_data: {
+                  mime_type:
+                    mimeType,
+                  data:
+                    inline.data
+                }
+              };
+            }
+
+            throw new Error(
+              'Bagian pesan tidak memiliki teks atau lampiran yang valid.'
+            );
+          });
+
+      if (
+        parts.length === 0
+      ) {
+        throw new Error(
+          'Pesan tidak memiliki isi.'
+        );
+      }
 
       return {
         role,
@@ -374,53 +384,192 @@ function sanitizeContents(contents) {
     });
 }
 
-export default async function handler(req, res) {
+function buildRequestBody(
+  contents,
+  codeExecution
+) {
+  const body = {
+    systemInstruction: {
+      parts: [
+        {
+          text:
+            ORYVAN_SYSTEM_PROMPT
+        }
+      ]
+    },
+
+    contents
+  };
+
+  /*
+   * Code Execution hanya diaktifkan
+   * jika frontend memang memintanya.
+   */
+  if (
+    codeExecution === true
+  ) {
+    body.tools = [
+      {
+        code_execution: {}
+      }
+    ];
+  }
+
+  return body;
+}
+
+async function requestGemini({
+  model,
+  requestBody,
+  apiKey,
+  signal
+}) {
+  const url =
+    `https://generativelanguage.googleapis.com/` +
+    `v1beta/models/${encodeURIComponent(model)}` +
+    `:streamGenerateContent?alt=sse`;
+
+  const response =
+    await fetch(url, {
+      method: 'POST',
+
+      headers: {
+        'Content-Type':
+          'application/json',
+        'x-goog-api-key':
+          apiKey
+      },
+
+      body:
+        JSON.stringify(
+          requestBody
+        ),
+
+      signal
+    });
+
+  const responseText =
+    await response.text();
+
+  return {
+    response,
+    responseText
+  };
+}
+
+function validateRequestBody(
+  body
+) {
+  if (
+    !body ||
+    typeof body !== 'object'
+  ) {
+    throw new Error(
+      'Format request tidak valid.'
+    );
+  }
+
+  if (
+    !Array.isArray(
+      body.contents
+    )
+  ) {
+    throw new Error(
+      'contents harus berupa array.'
+    );
+  }
+
+  if (
+    body.contents.length === 0
+  ) {
+    throw new Error(
+      'contents tidak boleh kosong.'
+    );
+  }
+
+  return true;
+}
+
+export default async function handler(
+  req,
+  res
+) {
   setSecurityHeaders(res);
 
-  if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST');
+  if (
+    req.method !== 'POST'
+  ) {
+    res.setHeader(
+      'Allow',
+      'POST'
+    );
 
-    return sendJson(res, 405, {
-      error: 'Method Not Allowed'
-    });
+    return sendJson(
+      res,
+      405,
+      {
+        error:
+          'Method Not Allowed'
+      }
+    );
   }
 
   const apiKey =
     process.env.GEMINI_API_KEY;
 
-  if (!apiKey) {
-    return sendJson(res, 500, {
-      error:
-        'Kredensial server belum dikonfigurasi.'
-    });
+  if (
+    typeof apiKey !== 'string' ||
+    !apiKey.trim()
+  ) {
+    return sendJson(
+      res,
+      500,
+      {
+        error:
+          'GEMINI_API_KEY belum dikonfigurasi di environment server.'
+      }
+    );
   }
 
   const clientKey =
     getClientKey(req);
 
-  if (rateLimited(clientKey)) {
-    return sendJson(res, 429, {
-      error:
-        'Terlalu banyak permintaan. Tunggu sebentar lalu coba lagi.'
-    });
+  if (
+    isRateLimited(clientKey)
+  ) {
+    return sendJson(
+      res,
+      429,
+      {
+        error:
+          'Terlalu banyak permintaan. Tunggu sebentar lalu coba lagi.'
+      }
+    );
   }
 
+  let requestBody;
+
   try {
-    const body =
-      req.body &&
-      typeof req.body === 'object'
-        ? req.body
-        : {};
+    validateRequestBody(
+      req.body
+    );
 
     let serialized;
 
     try {
-      serialized = JSON.stringify(body);
+      serialized =
+        JSON.stringify(
+          req.body
+        );
     } catch {
-      return sendJson(res, 400, {
-        error:
-          'Format permintaan tidak valid.'
-      });
+      return sendJson(
+        res,
+        400,
+        {
+          error:
+            'Request tidak dapat diproses.'
+        }
+      );
     }
 
     if (
@@ -429,15 +578,20 @@ export default async function handler(req, res) {
         'utf8'
       ) > MAX_BODY_BYTES
     ) {
-      return sendJson(res, 413, {
-        error:
-          'Permintaan terlalu besar. Kurangi ukuran pesan atau lampiran.'
-      });
+      return sendJson(
+        res,
+        413,
+        {
+          error:
+            'Request terlalu besar. Kurangi ukuran pesan atau lampiran.'
+        }
+      );
     }
 
     const requestedModel =
-      typeof body.model === 'string'
-        ? body.model.trim()
+      typeof req.body.model ===
+        'string'
+        ? req.body.model.trim()
         : '';
 
     const model =
@@ -447,240 +601,179 @@ export default async function handler(req, res) {
         ? requestedModel
         : DEFAULT_MODEL;
 
-    if (
-      !validateContents(
-        body.contents
-      )
-    ) {
-      return sendJson(res, 400, {
-        error:
-          'Isi percakapan tidak valid.'
-      });
-    }
+    const contents =
+      sanitizeContents(
+        req.body.contents
+      );
 
-    let contents;
-
-    try {
-      contents =
-        sanitizeContents(
-          body.contents
-        );
-    } catch (error) {
-      return sendJson(res, 400, {
-        error: getErrorMessage(
-          error,
-          'Lampiran atau isi pesan tidak valid.'
-        )
-      });
-    }
-
-    const requestBody = {
-      systemInstruction: {
-        parts: [
-          {
-            text:
-              ORYVAN_SYSTEM_PROMPT
-          }
-        ]
-      },
-
-      contents
-    };
+    requestBody =
+      buildRequestBody(
+        contents,
+        req.body.codeExecution ===
+          true
+      );
 
     /*
-     * Code Execution bersifat opsional.
+     * Jangan kirim parameter sampling seperti:
+     * temperature
+     * topP
+     * topK
      *
-     * Tidak aktif secara default.
+     * Model Gemini 3.6 Flash dan
+     * Gemini 3.5 Flash-Lite sudah
+     * tidak menggunakan parameter tersebut.
      */
-    if (
-      body.codeExecution === true
-    ) {
-      requestBody.tools = [
-        {
-          code_execution: {}
-        }
-      ];
-    }
-
     const controller =
       new AbortController();
 
     const timeout =
-      setTimeout(() => {
-        controller.abort();
-      }, 55_000);
+      setTimeout(
+        () => {
+          controller.abort();
+        },
+        REQUEST_TIMEOUT_MS
+      );
 
     try {
-      /*
-       * ==========================================================
-       * PERCOBAAN 1
-       * Gemini API v1beta + streaming
-       * ==========================================================
-       */
-      let result =
-        await callGemini({
-          version: 'v1beta',
+      const result =
+        await requestGemini({
           model,
           requestBody,
           apiKey,
           signal:
-            controller.signal,
-          streaming: true
+            controller.signal
         });
 
-      if (result.response.ok) {
-        return sendStreamingResponse(
-          res,
-          result.data
+      if (
+        result.response.ok
+      ) {
+        res.statusCode = 200;
+
+        res.setHeader(
+          'Content-Type',
+          'text/event-stream; charset=utf-8'
+        );
+
+        res.setHeader(
+          'Cache-Control',
+          'no-cache, no-transform'
+        );
+
+        res.setHeader(
+          'Connection',
+          'keep-alive'
+        );
+
+        return res.end(
+          result.responseText
         );
       }
 
-      /*
-       * ==========================================================
-       * PERCOBAAN 2
-       *
-       * Jika 404, coba endpoint v1.
-       *
-       * Ini membantu jika model tersedia tetapi endpoint
-       * v1beta tidak cocok dengan konfigurasi API saat ini.
-       * ==========================================================
-       */
-      if (
-        isNotFoundError(
-          result.response.status,
-          result.message
-        )
-      ) {
-        result =
-          await callGemini({
-            version: 'v1',
-            model,
-            requestBody,
-            apiKey,
-            signal:
-              controller.signal,
-            streaming: true
-          });
+      const message =
+        parseGoogleError(
+          result.responseText,
+          result.response.status
+        );
 
-        if (result.response.ok) {
-          return sendStreamingResponse(
-            res,
-            result.data
-          );
+      console.error(
+        'Gemini API error:',
+        {
+          model,
+          status:
+            result.response.status,
+          message
         }
+      );
+
+      if (
+        result.response.status ===
+        404
+      ) {
+        return sendJson(
+          res,
+          404,
+          {
+            error:
+              `Model "${model}" tidak ditemukan atau tidak tersedia.`
+          }
+        );
       }
 
-      /*
-       * ==========================================================
-       * PERCOBAAN 3
-       *
-       * Jika masih 404, gunakan generateContent biasa.
-       *
-       * Respons JSON akan dibungkus menjadi satu event SSE
-       * sehingga frontend ORYVAN tetap kompatibel.
-       * ==========================================================
-       */
       if (
-        isNotFoundError(
-          result.response.status,
-          result.message
-        )
+        result.response.status ===
+        400
       ) {
-        const fallbackVersions =
-          ['v1beta', 'v1'];
-
-        for (
-          const version
-          of fallbackVersions
-        ) {
-          const fallback =
-            await callGemini({
-              version,
-              model,
-              requestBody,
-              apiKey,
-              signal:
-                controller.signal,
-              streaming: false
-            });
-
-          if (
-            fallback.response.ok
-          ) {
-            const payload =
-              createFallbackPayload(
-                fallback.data
-              );
-
-            return sendSSE(
-              res,
-              payload
-            );
+        return sendJson(
+          res,
+          400,
+          {
+            error:
+              message ||
+              'Request ke Gemini tidak valid.'
           }
-
-          /*
-           * Jika salah satu fallback bukan 404,
-           * hentikan pencarian agar error sebenarnya
-           * tidak tertutup.
-           */
-          if (
-            !isNotFoundError(
-              fallback.response.status,
-              fallback.message
-            )
-          ) {
-            return sendJson(
-              res,
-              fallback.response.status,
-              {
-                error:
-                  fallback.message
-              }
-            );
-          }
-        }
+        );
       }
 
-      /*
-       * ==========================================================
-       * ERROR AKHIR
-       * ==========================================================
-       */
+      if (
+        result.response.status ===
+        401 ||
+        result.response.status ===
+        403
+      ) {
+        return sendJson(
+          res,
+          result.response.status,
+          {
+            error:
+              'Gemini API menolak kredensial atau akses project server.'
+          }
+        );
+      }
 
       if (
-        isNotFoundError(
-          result.response.status,
-          result.message
-        )
+        result.response.status ===
+        429
       ) {
-        return sendJson(res, 404, {
-          error:
-            `Model "${model}" tidak ditemukan atau ` +
-            `tidak tersedia untuk API key/project server saat ini. ` +
-            `Pastikan model tersebut tersedia pada Gemini API.`
-        });
+        return sendJson(
+          res,
+          429,
+          {
+            error:
+              'Kuota atau batas request Gemini sedang tercapai. Coba lagi nanti.'
+          }
+        );
       }
 
       return sendJson(
         res,
-        result.response.status,
+        result.response.status >=
+          500
+          ? 502
+          : result.response.status,
         {
           error:
-            result.message ||
-            `Gemini API error (${result.response.status})`
+            message ||
+            'Gemini API mengalami kesalahan.'
         }
       );
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(
+        timeout
+      );
     }
   } catch (error) {
     if (
-      error?.name === 'AbortError'
+      error?.name ===
+      'AbortError'
     ) {
-      return sendJson(res, 504, {
-        error:
-          'Permintaan ke Gemini terlalu lama dan dihentikan.'
-      });
+      return sendJson(
+        res,
+        504,
+        {
+          error:
+            'Permintaan ke Gemini terlalu lama dan dihentikan.'
+        }
+      );
     }
 
     console.error(
@@ -688,36 +781,16 @@ export default async function handler(req, res) {
       error
     );
 
-    return sendJson(res, 500, {
-      error:
-        getErrorMessage(
-          error,
-          'Terjadi kesalahan pada backend ORYVAN.'
-        )
-    });
+    return sendJson(
+      res,
+      400,
+      {
+        error:
+          getErrorMessage(
+            error,
+            'Request tidak valid.'
+          )
+      }
+    );
   }
 }
-
-function sendStreamingResponse(
-  res,
-  data
-) {
-  res.statusCode = 200;
-
-  res.setHeader(
-    'Content-Type',
-    'text/event-stream; charset=utf-8'
-  );
-
-  res.setHeader(
-    'Cache-Control',
-    'no-cache, no-transform'
-  );
-
-  res.setHeader(
-    'Connection',
-    'keep-alive'
-  );
-
-  return res.end(data);
-  }
