@@ -401,10 +401,6 @@ function buildRequestBody(
     contents
   };
 
-  /*
-   * Code Execution hanya diaktifkan
-   * jika frontend memang memintanya.
-   */
   if (
     codeExecution === true
   ) {
@@ -418,6 +414,15 @@ function buildRequestBody(
   return body;
 }
 
+/**
+ * Membuat request ke Gemini.
+ *
+ * Perubahan utama versi streaming:
+ * response dari Gemini TIDAK lagi dibaca
+ * menggunakan response.text().
+ *
+ * Stream akan diteruskan langsung ke client.
+ */
 async function requestGemini({
   model,
   requestBody,
@@ -429,32 +434,25 @@ async function requestGemini({
     `v1beta/models/${encodeURIComponent(model)}` +
     `:streamGenerateContent?alt=sse`;
 
-  const response =
-    await fetch(url, {
-      method: 'POST',
+  return fetch(url, {
+    method: 'POST',
 
-      headers: {
-        'Content-Type':
-          'application/json',
-        'x-goog-api-key':
-          apiKey
-      },
+    headers: {
+      'Content-Type':
+        'application/json',
+      'x-goog-api-key':
+        apiKey,
+      'Accept':
+        'text/event-stream'
+    },
 
-      body:
-        JSON.stringify(
-          requestBody
-        ),
+    body:
+      JSON.stringify(
+        requestBody
+      ),
 
-      signal
-    });
-
-  const responseText =
-    await response.text();
-
-  return {
-    response,
-    responseText
-  };
+    signal
+  });
 }
 
 function validateRequestBody(
@@ -488,6 +486,63 @@ function validateRequestBody(
   }
 
   return true;
+}
+
+/**
+ * Meneruskan ReadableStream dari Gemini
+ * langsung ke response client.
+ *
+ * Tidak menggunakan response.text()
+ * sehingga streaming tetap berjalan.
+ */
+async function pipeGeminiStream(
+  upstreamResponse,
+  res
+) {
+  if (
+    !upstreamResponse.body
+  ) {
+    throw new Error(
+      'Gemini tidak mengembalikan response stream.'
+    );
+  }
+
+  const reader =
+    upstreamResponse.body.getReader();
+
+  try {
+    while (true) {
+      const {
+        done,
+        value
+      } =
+        await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      if (
+        value &&
+        value.byteLength > 0
+      ) {
+        res.write(value);
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Tidak perlu melakukan apa pun.
+    }
+  }
+
+  /*
+   * Pastikan response selesai
+   * setelah seluruh stream upstream
+   * benar-benar selesai.
+   */
+  res.end();
 }
 
 export default async function handler(
@@ -613,16 +668,6 @@ export default async function handler(
           true
       );
 
-    /*
-     * Jangan kirim parameter sampling seperti:
-     * temperature
-     * topP
-     * topK
-     *
-     * Model Gemini 3.6 Flash dan
-     * Gemini 3.5 Flash-Lite sudah
-     * tidak menggunakan parameter tersebut.
-     */
     const controller =
       new AbortController();
 
@@ -634,8 +679,10 @@ export default async function handler(
         REQUEST_TIMEOUT_MS
       );
 
+    let upstreamResponse;
+
     try {
-      const result =
+      upstreamResponse =
         await requestGemini({
           model,
           requestBody,
@@ -644,118 +691,150 @@ export default async function handler(
             controller.signal
         });
 
+      /*
+       * Jangan membaca body response
+       * jika Gemini mengembalikan error.
+       *
+       * Untuk error, kita memang perlu
+       * membaca response sebagai text agar
+       * bisa mendapatkan pesan error.
+       */
       if (
-        result.response.ok
+        !upstreamResponse.ok
       ) {
-        res.statusCode = 200;
+        const responseText =
+          await upstreamResponse.text();
 
-        res.setHeader(
-          'Content-Type',
-          'text/event-stream; charset=utf-8'
-        );
+        const message =
+          parseGoogleError(
+            responseText,
+            upstreamResponse.status
+          );
 
-        res.setHeader(
-          'Cache-Control',
-          'no-cache, no-transform'
-        );
-
-        res.setHeader(
-          'Connection',
-          'keep-alive'
-        );
-
-        return res.end(
-          result.responseText
-        );
-      }
-
-      const message =
-        parseGoogleError(
-          result.responseText,
-          result.response.status
-        );
-
-      console.error(
-        'Gemini API error:',
-        {
-          model,
-          status:
-            result.response.status,
-          message
-        }
-      );
-
-      if (
-        result.response.status ===
-        404
-      ) {
-        return sendJson(
-          res,
-          404,
+        console.error(
+          'Gemini API error:',
           {
-            error:
-              `Model "${model}" tidak ditemukan atau tidak tersedia.`
+            model,
+            status:
+              upstreamResponse.status,
+            message
           }
         );
-      }
 
-      if (
-        result.response.status ===
-        400
-      ) {
+        if (
+          upstreamResponse.status ===
+          404
+        ) {
+          return sendJson(
+            res,
+            404,
+            {
+              error:
+                `Model "${model}" tidak ditemukan atau tidak tersedia.`
+            }
+          );
+        }
+
+        if (
+          upstreamResponse.status ===
+          400
+        ) {
+          return sendJson(
+            res,
+            400,
+            {
+              error:
+                message ||
+                'Request ke Gemini tidak valid.'
+            }
+          );
+        }
+
+        if (
+          upstreamResponse.status ===
+          401 ||
+          upstreamResponse.status ===
+          403
+        ) {
+          return sendJson(
+            res,
+            upstreamResponse.status,
+            {
+              error:
+                'Gemini API menolak kredensial atau akses project server.'
+            }
+          );
+        }
+
+        if (
+          upstreamResponse.status ===
+          429
+        ) {
+          return sendJson(
+            res,
+            429,
+            {
+              error:
+                'Kuota atau batas request Gemini sedang tercapai. Coba lagi nanti.'
+            }
+          );
+        }
+
         return sendJson(
           res,
-          400,
+          upstreamResponse.status >=
+            500
+            ? 502
+            : upstreamResponse.status,
           {
             error:
               message ||
-              'Request ke Gemini tidak valid.'
+              'Gemini API mengalami kesalahan.'
           }
         );
       }
 
-      if (
-        result.response.status ===
-        401 ||
-        result.response.status ===
-        403
-      ) {
-        return sendJson(
-          res,
-          result.response.status,
-          {
-            error:
-              'Gemini API menolak kredensial atau akses project server.'
-          }
-        );
-      }
+      /*
+       * Gemini berhasil.
+       *
+       * Mulai response SSE ke browser.
+       */
+      res.statusCode = 200;
 
-      if (
-        result.response.status ===
-        429
-      ) {
-        return sendJson(
-          res,
-          429,
-          {
-            error:
-              'Kuota atau batas request Gemini sedang tercapai. Coba lagi nanti.'
-          }
-        );
-      }
-
-      return sendJson(
-        res,
-        result.response.status >=
-          500
-          ? 502
-          : result.response.status,
-        {
-          error:
-            message ||
-            'Gemini API mengalami kesalahan.'
-        }
+      res.setHeader(
+        'Content-Type',
+        'text/event-stream; charset=utf-8'
       );
+
+      res.setHeader(
+        'Cache-Control',
+        'no-cache, no-transform'
+      );
+
+      res.setHeader(
+        'Connection',
+        'keep-alive'
+      );
+
+      /*
+       * Beberapa environment/proxy
+       * mendukung flushHeaders().
+       * Jika tersedia, kirim header
+       * secepat mungkin.
+       */
+      if (
+        typeof res.flushHeaders ===
+        'function'
+      ) {
+        res.flushHeaders();
+      }
+
+      await pipeGeminiStream(
+        upstreamResponse,
+        res
+      );
+
+      return;
     } finally {
       clearTimeout(
         timeout
@@ -766,14 +845,40 @@ export default async function handler(
       error?.name ===
       'AbortError'
     ) {
-      return sendJson(
-        res,
-        504,
-        {
-          error:
-            'Permintaan ke Gemini terlalu lama dan dihentikan.'
-        }
-      );
+      /*
+       * Jika response sudah mulai dikirim
+       * sebagai SSE, jangan mencoba mengirim
+       * JSON error kedua karena format response
+       * sudah berbeda.
+       */
+      if (
+        !res.headersSent
+      ) {
+        return sendJson(
+          res,
+          504,
+          {
+            error:
+              'Permintaan ke Gemini terlalu lama dan dihentikan.'
+          }
+        );
+      }
+
+      try {
+        res.write(
+          'data: ' +
+          JSON.stringify({
+            error:
+              'Permintaan ke Gemini terlalu lama dan dihentikan.'
+          }) +
+          '\n\n'
+        );
+        res.end();
+      } catch {
+        // Connection mungkin sudah tertutup.
+      }
+
+      return;
     }
 
     console.error(
@@ -781,16 +886,35 @@ export default async function handler(
       error
     );
 
-    return sendJson(
-      res,
-      400,
-      {
-        error:
-          getErrorMessage(
-            error,
-            'Request tidak valid.'
-          )
-      }
-    );
+    if (
+      !res.headersSent
+    ) {
+      return sendJson(
+        res,
+        400,
+        {
+          error:
+            getErrorMessage(
+              error,
+              'Request tidak valid.'
+            )
+        }
+      );
+    }
+
+    try {
+      res.write(
+        'data: ' +
+        JSON.stringify({
+          error:
+            'ORYVAN mengalami kesalahan saat memproses stream.'
+        }) +
+        '\n\n'
+      );
+
+      res.end();
+    } catch {
+      // Connection mungkin sudah tertutup.
+    }
   }
-}
+    }
